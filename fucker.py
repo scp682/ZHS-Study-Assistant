@@ -2000,26 +2000,44 @@ class Openai:
     def __parseStream(self, response: requests.Response, aim_start: str, aim_end: str) -> str:
         """解析 stream 响应"""
         cache = ""
-        for line in response.iter_lines():
-            if not line:
-                continue
-
-            try:
-                json_data = json.loads(line.decode('utf-8')[5:])
-                content = json_data.get("choices", [{}])[0].get(
-                    "delta", {}).get("content", "")
+        try:
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                text = line.decode('utf-8') if isinstance(line, bytes) else line
+                text = text.strip()
+                if text.startswith("data:"):
+                    text = text[5:].strip()
+                if text == "[DONE]":
+                    break
+                try:
+                    json_data = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(json_data, dict):
+                    continue
+                if json_data.get("error") or str(json_data.get("code", 0)) not in ("0", "200", "None"):
+                    error = json_data.get("error") or json_data
+                    message = error.get("message", "未知错误") if isinstance(error, dict) else "未知错误"
+                    raise ValueError(f"AI 接口返回错误 {json_data.get('code', '')}：{message}")
+                choices = json_data.get("choices") or []
+                content = (choices[0].get("delta") or choices[0].get("message") or {}).get("content", "") if choices else ""
                 if content:
                     cache += content
-                    # 使用正则寻找答案
-                    match = re.search(
-                        f"{re.escape(aim_start)}(.*?){re.escape(aim_end)}", cache, re.DOTALL)
-                    if match:
+                    if re.search(f"{re.escape(aim_start)}(.*?){re.escape(aim_end)}", cache, re.DOTALL):
                         return cache
-            except json.JSONDecodeError:
-                continue
+            if not cache:
+                raise ValueError("AI 接口未返回文本答案，请检查模型配置和服务状态。")
+            return cache
+        finally:
+            response.close()
 
     def openaiCompletion(self, prompt: str, aimStart: str = "```answer", aimEnd: str = "```", max_retries: int = 3, retry_delay: float = 1.0) -> str:
-        url = f"{self.baseUrl}/v1/chat/completions"
+        base = self.baseUrl.rstrip("/")
+        if base.endswith("/chat/completions"):
+            url = base
+        else:
+            url = base + ("/v1" if not urlsplit(base).path else "") + "/chat/completions"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.apiKey}",
@@ -2175,8 +2193,8 @@ class Openai:
         tokens = self.encoder.encode(prompt)
 
         # 如果大于32ktoken，取后32ktoken
-        if len(tokens) > 27.900 * 1000:
-            tokens = tokens[-27.900 * 1000:]
+        if len(tokens) > 27900:
+            tokens = tokens[-27900:]
 
             prompt = self.encoder.decode(tokens)
             logger.warning(
@@ -2185,6 +2203,9 @@ class Openai:
             aicompletion = self.zhiDaoCompletion(prompt)
         else:
             aicompletion = self.openaiCompletion(prompt)
+
+        if not isinstance(aicompletion, str) or not aicompletion.strip():
+            raise ValueError("AI 接口未返回有效文本答案。")
 
         # 寻找```answer \n ... \n```块
         answer_block = re.search(

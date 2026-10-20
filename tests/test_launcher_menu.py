@@ -3,7 +3,7 @@ import io
 import re
 import unittest
 
-from launcher_menu import SELECTED, build_panel, display_width, select_launcher_menu
+from launcher_menu import SELECTED, EXIT_INDEX, TITLES, build_panel, display_width, select_launcher_menu, select_result_menu
 
 
 class LauncherMenuTests(unittest.TestCase):
@@ -21,14 +21,19 @@ class LauncherMenuTests(unittest.TestCase):
         self.assertTrue(output.endswith("\033[0m\033[?25h"))
 
     def test_down_selects_each_action(self):
-        for steps in range(1, 5):
+        for steps in range(1, len(TITLES)):
             with self.subTest(steps=steps):
                 result, _ = self.select(["down"] * steps + ["enter"])
                 self.assertEqual(result, steps)
 
     def test_arrows_wrap_at_both_ends(self):
-        self.assertEqual(self.select(["up", "enter"])[0], 4)
-        self.assertEqual(self.select(["down"] * 5 + ["enter"])[0], 0)
+        self.assertEqual(self.select(["up", "enter"])[0], EXIT_INDEX)
+        self.assertEqual(self.select(["down"] * len(TITLES) + ["enter"])[0], 0)
+
+    def test_result_has_explicit_main_menu_and_escape_returns(self):
+        output = io.StringIO()
+        self.assertEqual(select_result_menu("0", key_reader=lambda: "back", output=output), 0)
+        self.assertIn("返回主菜单", output.getvalue())
 
     def test_number_keys_do_not_select_or_move(self):
         self.assertEqual(self.select(["2", "3", "", "enter"])[0], 0)

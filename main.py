@@ -126,8 +126,21 @@ parser.add_argument("-ai", "--aicourse", type=str, nargs=2,
 
 parser.add_argument("--noexam", type=bool,
                     help="Disable AI exam")
+parser.add_argument("--chapter-tests", choices=("menu", "list", "export", "answer"),
+                    help="Shared-course chapter tests: list, export or AI-answer")
+parser.add_argument("--chapter-exam", help="Student exam ID from the chapter-test list")
+parser.add_argument("--chapter-all", action="store_true", help="Answer all ordinary chapter tests in one selected course")
+parser.add_argument("--chapter-submit", action="store_true", help="Submit each paper after every answer is saved and verified")
 
 args = parser.parse_args()
+if args.chapter_tests and (args.aicourse or args.fetch or args.videos):
+    parser.error("章节测试不能与 AI课程、获取课程清单或视频模式同时使用")
+if args.chapter_exam and not args.chapter_tests:
+    parser.error("--chapter-exam 需要与 --chapter-tests 一起使用")
+if (args.chapter_all or args.chapter_submit) and args.chapter_tests != "answer":
+    parser.error("--chapter-all 和 --chapter-submit 仅用于 --chapter-tests answer")
+if args.chapter_all and args.chapter_exam:
+    parser.error("--chapter-all 不能与 --chapter-exam 同时使用")
 
 course = args.course
 username = args.username or config.username
@@ -203,13 +216,14 @@ if save_cookies and choice.reuse_cookies and os.path.exists(cookies_path):
         ls = fucker.getZhidaoList()
         if ls:
             fucker.getZhidaoContext(ls[-1].secret)
-        ls = fucker.getHikeList()
-        if ls:
-            fucker.getHikeContext(ls[-1].courseId)
-
-        ls = fucker.getZhidaoAiList()
-        if ls:
-            pass
+        if args.chapter_tests:
+            from chapter_tests import ChapterAPI
+            ChapterAPI.from_client(fucker).authenticate()
+        else:
+            ls = fucker.getHikeList()
+            if ls:
+                fucker.getHikeContext(ls[-1].courseId)
+            ls = fucker.getZhidaoAiList()
         print("Successfully recovered from saved cookies\n")
         cookies_loaded = True
     except Exception:
@@ -250,6 +264,20 @@ except (OSError, ValueError) as exc:
 # you can add cookies manually by setting cookies property of a Fucker instance
 # notice that cookies of zhihuishu.com expires if you login again in somewhere else
 # fucker.cookies = {}
+
+if args.chapter_tests:
+    from chapter_tests import run_chapter_cli
+    try:
+        chapter_outcome = run_chapter_cli(fucker, args.chapter_tests, course, args.chapter_exam, config.get("ai", {}),
+                                          submit=args.chapter_submit, all_tests=args.chapter_all)
+    except (MenuBack, KeyboardInterrupt):
+        raise SystemExit(BACK_CODE)
+    except Exception as exc:
+        print(f"章节测试处理未完成：{exc}")
+        raise SystemExit(1)
+    if isinstance(chapter_outcome, dict) and chapter_outcome.get("status") == "batch_stopped":
+        raise SystemExit(1)
+    raise SystemExit(BACK_CODE if args.chapter_tests == "menu" else 0)
 
 if args.aicourse:
     course_id, class_id = args.aicourse

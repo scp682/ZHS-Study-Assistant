@@ -9,10 +9,12 @@ set "MENU_MODE="
 set "RESULT=1"
 if /i "%~1"=="--check" set "CHECK_ONLY=1"
 if "%~1"=="" set "MENU_MODE=1"
+for %%A in (--setup-feishu --test-feishu --test-captcha --setup-chapter-ai) do if /i "%~1"=="%%A" set "MENU_MODE=1"
+if /i "%~1"=="--chapter-tests" if /i "%~2"=="menu" set "MENU_MODE=1"
 pushd "%~dp0"
 if errorlevel 1 goto directory_error
 
-for %%F in (main.py requirements.txt notification_settings.py account_login.py launcher_menu.py terminal_ui.py) do (
+for %%F in (main.py requirements.txt notification_settings.py account_login.py launcher_menu.py terminal_ui.py chapter_tests.py chapter_ai_settings.py) do (
     if not exist "%%F" (
         echo [错误] 缺少 %%F，请保持项目文件完整。
         goto finish
@@ -81,10 +83,12 @@ if defined CHECK_ONLY (
     set "RESULT=0"
     goto finish
 )
-if defined MENU_MODE goto menu
 if /i "%~1"=="--setup-feishu" goto feishu_setup
 if /i "%~1"=="--test-feishu" goto feishu_test
 if /i "%~1"=="--test-captcha" goto captcha_test
+if /i "%~1"=="--setup-chapter-ai" goto chapter_ai_setup
+if /i "%~1"=="--chapter-tests" if /i "%~2"=="menu" goto chapter_tests
+if defined MENU_MODE goto menu
 "%PYEXE%" -u "main.py" %*
 set "RESULT=%ERRORLEVEL%"
 goto after_action
@@ -96,7 +100,10 @@ if "%MENU_CHOICE%"=="0" goto password_login
 if "%MENU_CHOICE%"=="1" goto feishu_setup
 if "%MENU_CHOICE%"=="2" goto feishu_test
 if "%MENU_CHOICE%"=="3" goto qr_login
-if "%MENU_CHOICE%"=="4" goto menu_exit
+if "%MENU_CHOICE%"=="4" goto chapter_tests
+if "%MENU_CHOICE%"=="5" goto chapter_ai_setup
+if "%MENU_CHOICE%"=="6" goto captcha_test
+if "%MENU_CHOICE%"=="7" goto menu_exit
 goto menu_error
 
 :password_login
@@ -124,13 +131,24 @@ goto after_action
 set "RESULT=%ERRORLEVEL%"
 goto after_action
 
+:chapter_ai_setup
+"%PYEXE%" -u "chapter_ai_settings.py"
+set "RESULT=%ERRORLEVEL%"
+goto after_action
+
+:chapter_tests
+"%PYEXE%" -u "main.py" --chapter-tests menu
+set "RESULT=%ERRORLEVEL%"
+goto after_action
+
 :after_action
 if "%RESULT%"=="20" if defined MENU_MODE goto menu
 if "%RESULT%"=="20" set "RESULT=0"
 echo.
 echo [提示] 本次操作已结束，退出代码：%RESULT%
 if not defined MENU_MODE goto finish
-pause
+"%PYEXE%" -u "launcher_menu.py" --result "%RESULT%"
+if errorlevel 1 goto menu_exit
 goto menu
 
 :menu_exit

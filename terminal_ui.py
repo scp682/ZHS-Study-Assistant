@@ -83,7 +83,7 @@ def fit_text(text, width):
 
 
 def build_panel(title, subtitle, options=(), descriptions=(), *, selected=0,
-                width=76, compact=False, notes=(), footer="↑ ↓ 切换   Enter 确认   Esc 返回"):
+                width=76, compact=False, dense=False, notes=(), footer="↑ ↓ 切换   Enter 确认   Esc 返回"):
     inside = width - 2
 
     def row(text="", color=MUTED, background=PANEL):
@@ -93,6 +93,13 @@ def build_panel(title, subtitle, options=(), descriptions=(), *, selected=0,
     def rule(left, right):
         return f"{BORDER}{left}{'─' * inside}{right}{RESET}"
 
+    if dense:
+        return ([rule("╭", "╮"), row(title, WHITE + "\033[1m"), row(subtitle), rule("├", "┤")]
+                + [row(note) for note in notes]
+                + [row(("› " if i == selected else "  ") + option,
+                       WHITE if i == selected else MUTED, SELECTED if i == selected else PANEL)
+                   for i, option in enumerate(options)]
+                + [rule("├", "┤"), row(footer, ACCENT), rule("╰", "╯")])
     lines = [rule("╭", "╮"), row(), row("Z H S   /   P E R S O N A L", ACCENT),
              row(title, WHITE + "\033[1m"), row(subtitle), row(), rule("├", "┤"), row()]
     for note in notes:
@@ -117,11 +124,8 @@ def render_panel(title, subtitle, options=(), descriptions=(), **kwargs):
     width = max(12, min(76, columns - 4))
     lines = build_panel(title, subtitle, options, descriptions, width=width,
                         compact=rows < 31 or columns < 54, **kwargs)
-    # Drop the optional brand and extra spacing in short consoles.
     if len(lines) >= rows:
-        lines = [line for line in lines if "Z H S" not in line]
-        blank = fit_text("", width - 2)
-        lines = [line for line in lines if blank not in line.replace(PANEL, "").replace(MUTED, "")]
+        lines = build_panel(title, subtitle, options, descriptions, width=width, dense=True, **kwargs)
     left = " " * max(0, (columns - width) // 2)
     top = max(0, min(4, (rows - len(lines) - 1) // 3))
     return "\033[H" + "\n" * top + "\n".join(left + line for line in lines) + "\n\033[J"
@@ -132,13 +136,24 @@ def select_menu(title, subtitle, options, descriptions=(), *, notes=(),
     stream = output or sys.stdout
     read_key = key_reader or read_menu_key
     selected = 0
+    first = 0
     extra = {"footer": footer} if footer else {}
     with terminal_style(stream):
         stream.write("\033[2J\033[H\033[?25l")
         try:
             while True:
-                stream.write(render_panel(title, subtitle, options, descriptions,
-                                          selected=selected, notes=notes, **extra))
+                rows = shutil.get_terminal_size((100, 32)).lines
+                capacity = max(1, rows - len(notes) - 9)
+                if selected < first:
+                    first = selected
+                if selected >= first + capacity:
+                    first = selected - capacity + 1
+                last = min(len(options), first + capacity)
+                visible_footer = dict(extra)
+                if len(options) > capacity:
+                    visible_footer["footer"] = f"{first + 1}–{last}/{len(options)} 项   ↑ ↓ 切换   Enter 确认   Esc 返回"
+                stream.write(render_panel(title, subtitle, options[first:last], descriptions[first:last],
+                                          selected=selected-first, notes=notes, **visible_footer))
                 stream.flush()
                 while True:
                     key = read_key()
@@ -158,6 +173,42 @@ def show_page(title, subtitle, notes=(), *, footer="Esc 取消返回   /back 返
     with terminal_style(stream):
         stream.write("\033[2J" + render_panel(title, subtitle, notes=notes, footer=footer))
         stream.flush()
+
+
+def wrap_text(text, width):
+    """Wrap full paths and mixed Chinese/Latin text without dropping content."""
+    lines = []
+    for paragraph in str(text).splitlines() or [""]:
+        current, used = "", 0
+        for char in paragraph:
+            if not char.isprintable():
+                continue
+            size = display_width(char)
+            if current and used + size > width:
+                lines.append(current)
+                current, used = "", 0
+            current += char
+            used += size
+        lines.append(current)
+    return lines
+
+
+def show_result_page(title, subtitle, notes=(), *, back_label="返回上一级", key_reader=None, output=None):
+    """A styled result page with explicit return and pagination for long content."""
+    columns, rows = shutil.get_terminal_size((100, 32))
+    width = max(6, min(76, columns - 4) - 6)
+    lines = [line for note in notes for line in wrap_text(note, width)]
+    capacity = max(1, rows - 12)
+    pages = [lines[i:i+capacity] for i in range(0, len(lines), capacity)] or [[]]
+    page = 0
+    while True:
+        actions = (["上一页"] if page else []) + (["下一页"] if page+1 < len(pages) else [])
+        choice = select_menu(title, subtitle + (f" · {page+1}/{len(pages)} 页" if len(pages) > 1 else ""),
+                             actions + [back_label], notes=pages[page], back_index=len(actions),
+                             key_reader=key_reader, output=output)
+        if choice == len(actions):
+            return
+        page += -1 if actions[choice] == "上一页" else 1
 
 
 def prompt_field(label, *, hidden=False, input_fn=None):

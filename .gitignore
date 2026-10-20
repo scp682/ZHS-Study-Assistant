@@ -151,3 +151,7 @@ AiDownloadCache
 qr*.png
 qrcode*.jpg
 playwright/.auth/
+
+# Private chapter questions, generated answers and local protocol analysis
+/chapter_test_data/
+/.chapter_protocol/
