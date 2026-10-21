@@ -261,6 +261,12 @@ class Fucker:
 #            logger.exception(e)
 #            raise Exception(f"QR login failed: {e}")
 
+    def _study_event(self, event, **details):
+        """Forward display events only when the interactive workbench is active."""
+        ui = getattr(self, "_study_ui", None)
+        if ui is not None:
+            ui.update(event, **details)
+
     def fuckWhatever(self):
         """Fuck whatever is found"""
         zhidao_ids = [c.secret for c in self.getZhidaoList()]
@@ -269,6 +275,7 @@ class Fucker:
                 self.fuckZhidaoCourse(i)
             except Exception as e:
                 logger.exception(e)
+                self._study_event("notice", message=f"共享课未完成：{e}")
                 continue
         hike_ids = [c.courseId for c in self.getHikeList()]
         for i in hike_ids:
@@ -276,6 +283,7 @@ class Fucker:
                 self.fuckHikeCourse(i)
             except Exception as e:
                 logger.exception(e)
+                self._study_event("notice", message=f"校内课未完成：{e}")
                 continue
 
     def fuckCourse(self, course_id:str):
@@ -404,6 +412,9 @@ class Fucker:
         ctx = self.getZhidaoContext(RAC_id)
         course = ctx.course
         chapters = ctx.chapters
+        self._study_event("course", course_id=RAC_id, name=course.courseInfo.name or course.courseInfo.enName,
+                          total=sum(len(lesson.videoSmallLessons) for chapter in chapters.videoChapterDtos
+                                    for lesson in chapter.videoLessons))
         
         # start fucking
         tprint(f"Fucking Zhidao course: {course.courseInfo.name or course.courseInfo.enName}")
@@ -420,6 +431,7 @@ class Fucker:
                 tprint(prefix) # extra line as separator
                 tprint(f"{prefix}__Fucking chapter {chapter.name}"[:w_lim])
                 for lesson in chapter.videoLessons:
+                    self._study_event("chapter", name=f"{chapter.name} / {lesson.name}")
                     tprint(prefix*2)
                     tprint(f"{prefix*2}__Fucking lesson {lesson.name}"[:w_lim])
                     for video in lesson.videoSmallLessons:
@@ -427,6 +439,7 @@ class Fucker:
                         try:
                             self.fuckZhidaoVideo(RAC_id, video.videoId)
                         except TimeLimitExceeded as e:
+                            self._study_event("notice", message="已达到本课运行时限")
                             logger.info(f"Fucking time limit exceeded: {e}")
                             self._pushplus("fuckZHS","刷课已完成")
                             self._bark("fuckZHS","刷课已完成")
@@ -435,12 +448,16 @@ class Fucker:
                             return
                         except Exception as e:
                             logger.exception(e)
+                            self._study_event("error", message=f"{video.name}：{e}")
                             self._pushplus("fuckZHS",e)
                             self._bark("fuckZHS",e)
                             tprint(f"{prefix*3}##Failed: {e}"[:w_lim])
         except KeyboardInterrupt:
             logger.info("User interrupted")
-        wipeLine()
+            if getattr(self, "_study_ui", None) is not None:
+                raise
+        if getattr(self, "_study_ui", None) is None:
+            wipeLine()
         tprint(prefix)
         tprint(f"\r{prefix}__Fucked course {course.courseInfo.name}, cost {time.time()-begin_time:.2f}s\n")
     
@@ -458,8 +475,12 @@ class Fucker:
         watch_state = video.watchState
         if not video:
             raise ValueError(f"Video {video_id} not found")
+        self._study_event("video", name=video.name, course_id=RAC_id,
+                          course_name=ctx.course.courseInfo.name or ctx.course.courseInfo.enName, current=played_time,
+                          target=max(video.videoSec * self.end_thre, 1.0), speed=self.speed or 1.5)
         if watch_state == 1 and self.end_thre <= 1.0:  # check end_thre in case someone wants to rewatch
             logger.info(f"Video {video.name} already watched")
+            self._study_event("skip")
             return
         # get token id from pre learning note
         token_id = self.prelearningNote(RAC_id, video_id).studiedLessonDto.id
@@ -553,7 +574,11 @@ class Fucker:
             action = "pause a minute" if pause else \
                     f"fucking {video.videoId}" if answer is None else "answering quiz"
             progressBar(s, e, prefix=action, suffix="done", progressbar_view=self.progressbar_view)
+            self._study_event("progress", current=played_time, target=end_time,
+                              status="正在处理随堂题" if answer is not None else
+                              f"暂停休息 · 剩余 {pause} 秒" if pause else "正在学习")
         ##### end main event loop
+        self._study_event("complete")
         time.sleep(random()+1) # old Joe needs more sleep
 
     def answerZhidao(self, q:dict):
@@ -579,7 +604,10 @@ class Fucker:
                                "在相应课程中完成官方要求的验证。程序已暂停当前操作，"
                                "每 15 秒重试一次，通过后自动继续；按 Ctrl+C 可中止。")
                     logger.info(message)
-                    print(f"\n{message}\a", flush=True)
+                    if getattr(self, "_study_ui", None) is not None:
+                        self._study_event("waiting")
+                    else:
+                        print(f"\n{message}\a", flush=True)
                     notification = message + "\n时间：" + datetime.now().astimezone().isoformat(timespec="seconds")
                     for channel, notify in (("PushPlus", self._pushplus), ("Bark", self._bark),
                                             ("飞书", self._feishu)):
@@ -595,7 +623,10 @@ class Fucker:
                 if waiting_for_captcha:
                     message = "验证后的请求已成功，继续运行。"
                     logger.info(message)
-                    print(message, flush=True)
+                    if getattr(self, "_study_ui", None) is not None:
+                        self._study_event("resume")
+                    else:
+                        print(message, flush=True)
                 return ret
             # Keep the video loop paused and rebuild the timestamp/encrypted form
             # on every retry. KeyboardInterrupt deliberately propagates.
@@ -889,6 +920,13 @@ class Fucker:
         tprint = print if self.tree_view else lambda *a, **k: None
         begin_time = time.time()
         root = self.getHikeContext(course_id).root
+
+        def count_resources(nodes):
+            return sum(count_resources(node.childList) if node.childList else 1 for node in nodes)
+
+        name = next((c.courseName for c in (self.courses.hike or [])
+                     if str(c.courseId) == str(course_id)), f"校内课程 {course_id}")
+        self._study_event("course", course_id=course_id, name=name, total=count_resources(root))
         
         prefix = self.prefix
         logger.info(f"Fucking Hike course {course_id} (total root chapters: {len(root)})")
@@ -898,8 +936,11 @@ class Fucker:
                 self._traverse(course_id, chapter)
         except KeyboardInterrupt:
             logger.info("user interrupted")
+            if getattr(self, "_study_ui", None) is not None:
+                raise
         logger.info(f"Fucked course {course_id}, cost {time.time()-begin_time}s")
-        wipeLine()
+        if getattr(self, "_study_ui", None) is None:
+            wipeLine()
         tprint(prefix)
         tprint(f"{prefix}__Fucked course {course_id}, cost {time.time()-begin_time:.2f}s\n")
 
@@ -923,6 +964,8 @@ class Fucker:
         interval = 30              # interval between 2 progess reports
         end_time = max(total_time*self.end_thre, 1.0)
         played_time = prev_time    # total video played time
+        self._study_event("video", name=file_info.get("name") or file_info.get("fileName"), course_id=course_id,
+                          current=played_time, target=end_time, speed=speed)
         # start main loop
         while played_time <= end_time:
             time.sleep(1)
@@ -934,7 +977,9 @@ class Fucker:
                 ret_time = self.saveStuStudyRecord(course_id,file_id,played_time,prev_time,start_date) # report progress
                 prev_time, played_time = ret_time, ret_time
             progressBar(played_time, end_time, prefix=f"fucking {file_id}", suffix="done", progressbar_view=self.progressbar_view)
+            self._study_event("progress", current=played_time, target=end_time)
         logger.info(f"Fucked video {file_id} of course {course_id}, cost {time.time()-begin_time:.2f}s")
+        self._study_event("complete")
         time.sleep(random()+1) # more human-like
 
     def fuckFile(self, course_id, file_id):
@@ -953,6 +998,7 @@ class Fucker:
         prefix = self.prefix * depth
         if node.childList: # if childList is not None, then it's a chapter
             chapter = node
+            self._study_event("chapter", name=chapter.name)
             logger.debug(f"Fucking chapter {chapter.id}")
             tprint(prefix) # separate chapters
             tprint(f"{prefix}__Fucking chapter {chapter.name}"[:w_lim])
@@ -961,11 +1007,14 @@ class Fucker:
         else: # if childList is None, then it's a file
             file = node
             file.studyTime = file.studyTime or 0 # sometimes it's None
+            self._study_event("video", name=file.name, course_id=course_id, current=file.studyTime,
+                              target=file.totalTime * self.end_thre, speed=self.speed or 1.25)
             logger.debug(f"Fucking file {file.id}, data type: {file.dataType}")
             tprint(f"{prefix}__Fucking {file.name}"[:w_lim])
 
             if file.studyTime >= file.totalTime*self.end_thre:
                 logger.debug(f"Skipped file {file.id}")
+                self._study_event("skip")
                 return
 
             try:
@@ -973,13 +1022,17 @@ class Fucker:
                     case 3:
                         self.fuckHikeVideo(course_id, file.id, file.studyTime)
                     case None:
+                        self._study_event("error", message=f"不支持的资源类型：{file.name}")
                         tprint(f"{prefix}##Unsupported file type, may be a quiz"[:w_lim])
                     case _:
                         self.fuckFile(course_id, file.id)
+                        self._study_event("complete")
             except TimeLimitExceeded as e:
+                self._study_event("notice", message="已达到本课运行时限")
                 logger.info(f"Time limit exceeded, video {file.id} skipped")
                 tprint(f"{prefix}##Time limit exceeded: {e}")
             except Exception as e:
+                self._study_event("error", message=f"{file.name}：{e}")
                 logger.error(f"Failed to fuck file {file.id} of course {course_id}")
                 logger.exception(e)
                 tprint(f"{prefix}##Failed: {e}"[:w_lim])

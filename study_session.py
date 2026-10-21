@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from terminal_ui import BACK_CODE, MenuBack, select_menu, show_page, show_result_page
+from study_ui import StudyDashboard
 
 
 def run_video_courses(client, courses=None, videos=None, execution_path=None):
@@ -51,8 +52,8 @@ def run_authenticated_menu(client, ai_config=None, courses=None, videos=None, ex
         title = "自动刷课" if selected == 0 else "AI 做题"
         try:
             if selected == 0:
-                show_page(title, "正在运行", ("完成后可返回功能选择。",), footer="Ctrl+C 中止并返回")
-                subtitle, notes = run_video_courses(client, courses, videos, execution_path)
+                with StudyDashboard(client):
+                    subtitle, notes = run_video_courses(client, courses, videos, execution_path)
                 show_result_page(title, subtitle, notes, back_label="返回功能选择")
             else:
                 run_chapter_cli(client, "menu", courses, ai_config=ai_config)

@@ -14,7 +14,7 @@ if /i "%~1"=="--chapter-tests" if /i "%~2"=="menu" set "MENU_MODE=1"
 pushd "%~dp0"
 if errorlevel 1 goto directory_error
 
-for %%F in (main.py requirements.txt notification_settings.py account_login.py launcher_menu.py terminal_ui.py study_session.py chapter_tests.py chapter_ai_settings.py) do (
+for %%F in (main.py requirements.txt notification_settings.py account_login.py launcher_menu.py terminal_ui.py study_session.py study_ui.py chapter_tests.py chapter_ai_settings.py) do (
     if not exist "%%F" (
         echo [错误] 缺少 %%F，请保持项目文件完整。
         goto finish
