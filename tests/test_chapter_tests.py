@@ -17,7 +17,7 @@ from Crypto.Util.Padding import unpad
 from chapter_tests import (API_ROOT, IV, ChapterAPI, ChapterError, ChapterRunner,
                            PaperContext, Question, compact_json, parse_questions,
                            recover_key, run_chapter_cli, run_chapter_batch, run_chapter_selection,
-                           UnsupportedChapter, validate_answers)
+                           UnsupportedChapter, validate_answers, homework_kind)
 from ObjDict import ObjDict
 
 
@@ -36,6 +36,12 @@ def raw_question(eid="q1", kind=1, name="Choose the correct answer."):
 def paper(*questions):
     return {"state": 1, "examBase": {"chapterId": 7,
              "workExamParts": [{"questionDtos": list(questions or [raw_question()])}]}}
+
+
+def meeting_paper(*questions):
+    data = paper(*questions)
+    data["examBase"].pop("chapterId")
+    return data
 
 
 CONTEXT = PaperContext("recruit", "course", "student-exam", "exam", "school")
@@ -136,6 +142,28 @@ class ProtocolTests(unittest.TestCase):
             self.api.list_tests("r", "c")
         self.assertEqual(self.api.request.call_count, 2)
 
+    def test_empty_pending_list_can_be_omitted_on_terminal_page(self):
+        # Observed on the real API after all pending homework was submitted.
+        for result in ({"next": -1}, {"next": "-1", "studentHomeworkList": None},
+                       {"next": -1, "studentHomeworkList": []}):
+            with self.subTest(result=result):
+                self.session.post.return_value = response({"status": 200, "rt": result})
+                self.assertEqual(self.api.list_tests("recruit", "course"), [])
+
+    def test_omitted_final_page_preserves_items_from_previous_pages(self):
+        self.api.request = Mock(side_effect=[
+            {"rt": {"studentHomeworkList": [{"id": "pending"}], "next": 1}},
+            {"rt": {"next": -1}}])
+        self.assertEqual(self.api.list_tests("recruit", "course"), [{"id": "pending"}])
+        self.assertEqual(self.api.request.call_count, 2)
+
+    def test_missing_list_without_terminal_marker_is_still_an_error(self):
+        for result in ({}, {"next": 1}, {"next": 0, "studentHomeworkList": None},
+                       {"next": -1, "studentHomeworkList": {}}, None):
+            with self.subTest(result=result), self.assertRaises(ChapterError):
+                self.session.post.return_value = response({"status": 200, "rt": result})
+                self.api.list_tests("recruit", "course")
+
     def test_rejects_unrelated_write_endpoint(self):
         with self.assertRaises(ValueError):
             self.api.request("answer/applyRedo", {})
@@ -155,15 +183,18 @@ class ProtocolTests(unittest.TestCase):
 
     def test_detects_login_redirect(self):
         self.session.get.return_value.url = "https://passport.zhihuishu.com/login"
-        with self.assertRaisesRegex(ChapterError, "重新扫码"):
+        self.session.cookies.get.return_value = '{"uuid":"same-user"}'
+        self.api.request = Mock(return_value={"rt": {"loginstatus": False}})
+        with self.assertRaisesRegex(ChapterError, "返回登录首页"):
             self.api.authenticate()
 
     def test_cas_callback_html_is_checked_by_api_identity(self):
         self.session.get.return_value.url = "https://studentexam-api.zhihuishu.com/studentExam/gateway/f/v1/gologin/login"
         self.session.cookies.get.return_value = '{"uuid":"same-user"}'
-        self.api.request = Mock(return_value={"rt": {"uuid": "same-user"}})
+        self.api.request = Mock(side_effect=[{"rt": {"loginstatus": False}}, {"rt": {"uuid": "same-user"}}])
         self.api.authenticate()
-        self.api.request.assert_called_once_with("ulogin/getLoginUserInfo", {})
+        self.assertEqual(self.api.request.call_count, 2)
+        self.session.get.assert_called_once()
 
     def test_cas_identity_mismatch_is_not_accepted(self):
         self.session.get.return_value.url = "https://onlineexamh5new.zhihuishu.com/stuExamWeb.html"
@@ -171,6 +202,63 @@ class ProtocolTests(unittest.TestCase):
         self.api.request = Mock(return_value={"rt": {"uuid": "other-user"}})
         with self.assertRaises(ChapterError):
             self.api.authenticate()
+
+
+class SharedLoginTests(unittest.TestCase):
+    def setUp(self):
+        self.client = Mock()
+        self.client.cookies = requests.cookies.RequestsCookieJar()
+        self.client.cookies.set("CASLOGC", '{"uuid":"same-user"}', domain=".zhihuishu.com")
+        self.client.session = requests.Session()
+        self.client.proxies = {}
+        self.client.headers = {"User-Agent": "test-agent"}
+        self.api = ChapterAPI.from_client(self.client)
+        self.api.session.get = Mock()
+        self.api.request = Mock(return_value={"rt": {"uuid": "same-user", "loginstatus": True}})
+
+    def test_valid_exam_session_does_not_require_a_new_cas_ticket(self):
+        self.api.session.cookies.set("JSESSIONID", "exam-session", domain="studentexam-api.zhihuishu.com")
+        self.api.authenticate()
+        self.api.session.get.assert_not_called()
+        self.assertEqual(self.client.cookies.get("JSESSIONID"), "exam-session")
+
+    def test_video_session_reset_does_not_destroy_exam_login(self):
+        self.api.session.cookies.set("JSESSIONID", "exam-session", domain="studentexam-api.zhihuishu.com")
+        self.api.authenticate()
+        self.client.session.cookies.clear()
+        self.client.session.cookies.set("JSESSIONID", "video-session", domain="studyservice-api.zhihuishu.com")
+        api = ChapterAPI.from_client(self.client)
+        self.assertIs(api, self.api)
+        api.authenticate()
+        self.assertEqual(api.session.cookies.get("JSESSIONID"), "exam-session")
+        self.api.session.get.assert_not_called()
+
+    def test_changing_account_does_not_reuse_exam_session(self):
+        self.client.cookies.set("CASLOGC", '{"uuid":"other-user"}', domain=".zhihuishu.com")
+        self.assertIsNot(ChapterAPI.from_client(self.client), self.api)
+
+    def test_cas_redirect_cannot_replace_the_selected_identity(self):
+        self.api.request.side_effect = [{"rt": {"loginstatus": False}}, {"rt": {"uuid": "other-user"}}]
+        def redirect(*args, **kwargs):
+            self.api.session.cookies.set("CASLOGC", '{"uuid":"other-user"}', domain=".zhihuishu.com")
+            return Mock(url="https://onlineexamh5new.zhihuishu.com/stuExamWeb.html")
+        self.api.session.get.side_effect = redirect
+        with self.assertRaises(ChapterError):
+            self.api.authenticate()
+        self.assertIn('same-user', self.client.cookies.get("CASLOGC"))
+
+    def test_invalid_loginstatus_is_not_accepted_even_with_uuid(self):
+        self.api.request.return_value = {"rt": {"uuid": "same-user", "loginstatus": False}}
+        with self.assertRaises(ChapterError):
+            self.api.authenticate()
+
+    def test_failed_exam_login_does_not_contaminate_video_cookies(self):
+        self.api.request.return_value = {"rt": {"loginstatus": False}}
+        self.api.session.cookies.set("JSESSIONID", "unverified", domain="studentexam-api.zhihuishu.com")
+        self.api.session.get.return_value = Mock(url="https://passport.zhihuishu.com/login")
+        with self.assertRaises(ChapterError):
+            self.api.authenticate()
+        self.assertIsNone(self.client.cookies.get("JSESSIONID"))
 
 
 class QuestionTests(unittest.TestCase):
@@ -272,6 +360,74 @@ class RunnerTests(unittest.TestCase):
         self.api.read_answers.assert_not_called()
         self.api.save_answer.assert_not_called()
 
+    def test_meeting_without_chapter_id_is_saved_and_read_back(self):
+        self.api.read_answers.side_effect = [{}, {"q1": {"answer": "option-91"}}]
+        result = self.runner.run(meeting_paper(), meeting=True)
+        self.assertEqual(result["status"], "saved")
+        self.assertEqual(self.read_report()["kind"], "meeting")
+        self.api.save_answer.assert_called_once()
+        self.api.submit_paper.assert_not_called()
+
+    def test_other_homework_without_chapter_id_is_saved_and_read_back(self):
+        self.api.read_answers.side_effect = [{}, {"q1": {"answer": "option-91"}}]
+        result = self.runner.run(meeting_paper(), homework=True)
+        self.assertEqual((result["status"], result["kind"]), ("saved", "other"))
+        self.api.save_answer.assert_called_once()
+        self.assertEqual(self.api.read_answers.call_count, 2)
+        self.api.submit_paper.assert_not_called()
+
+    def test_other_homework_submit_requires_final_read_and_confirmed_state(self):
+        self.api.read_answers.side_effect = [{}, {"q1": {"answer": "option-91"}}, {"q1": {"answer": "option-91"}}]
+        self.api.submit_paper.return_value = {"statu": 1}
+        self.api.open_paper.return_value = {"state": 4}
+        result = self.runner.run(meeting_paper(), homework=True, submit=True)
+        self.assertEqual((result["status"], result["kind"]), ("submitted", "other"))
+        self.assertTrue(result["submitted"])
+        self.api.submit_paper.assert_called_once_with(CONTEXT, 1)
+
+    def test_submitted_other_homework_is_not_reopened_for_answering(self):
+        with self.assertRaisesRegex(ChapterError, "已提交或已结束"):
+            self.runner.run({**meeting_paper(), "state": 4}, homework=True, submit=True)
+        self.solve.assert_not_called()
+        self.api.save_answer.assert_not_called()
+        self.api.submit_paper.assert_not_called()
+
+    def test_other_homework_readback_mismatch_never_submits(self):
+        self.api.read_answers.side_effect = [{}, {"q1": {"answer": "option-23"}}]
+        with self.assertRaisesRegex(ChapterError, "回读答案不一致"):
+            self.runner.run(meeting_paper(), homework=True, submit=True)
+        self.api.submit_paper.assert_not_called()
+
+    def test_meeting_submit_still_requires_final_read_and_server_confirmation(self):
+        self.api.read_answers.side_effect = [{}, {"q1": {"answer": "option-91"}}, {"q1": {"answer": "option-91"}}]
+        self.api.submit_paper.return_value = {"statu": 1}
+        self.api.open_paper.return_value = {"state": 4}
+        result = self.runner.run(meeting_paper(), submit=True, meeting=True)
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["kind"], "meeting")
+        self.api.submit_paper.assert_called_once_with(CONTEXT, 1)
+
+    def test_meeting_readback_mismatch_never_submits(self):
+        self.api.read_answers.side_effect = [{}, {"q1": {"answer": "option-23"}}]
+        with self.assertRaisesRegex(ChapterError, "回读答案不一致"):
+            self.runner.run(meeting_paper(), submit=True, meeting=True)
+        self.api.submit_paper.assert_not_called()
+
+    def test_submitted_meeting_is_not_answered_or_resubmitted(self):
+        with self.assertRaisesRegex(ChapterError, "已提交或已结束"):
+            self.runner.run({**meeting_paper(), "state": 4}, submit=True, meeting=True)
+        self.api.read_answers.assert_not_called()
+        self.solve.assert_not_called()
+        self.api.save_answer.assert_not_called()
+        self.api.submit_paper.assert_not_called()
+
+    def test_meeting_media_question_is_not_sent_to_model_or_saved(self):
+        self.api.read_answers.return_value = {}
+        with self.assertRaises(ChapterError):
+            self.runner.run(meeting_paper(raw_question(name='<img src="tea.png">Choose.')), meeting=True)
+        self.solve.assert_not_called()
+        self.api.save_answer.assert_not_called()
+
     def test_submit_runs_once_after_final_read_and_confirms_server_state(self):
         events = []
         reads = iter([{}, {"q1": {"answer": "option-91"}}, {"q1": {"answer": "option-91"}}])
@@ -349,6 +505,35 @@ class CliTests(unittest.TestCase):
         solver.assert_not_called()
         self.api.save_answer.assert_not_called()
 
+    def test_empty_pending_list_never_opens_paper_or_starts_ai(self):
+        self.api.list_tests.return_value = []
+        for action in ("list", "export", "answer"):
+            with self.subTest(action=action), patch("chapter_tests.ChapterAPI.from_client", return_value=self.api), \
+                 patch("chapter_tests.AISolver") as solver, patch("chapter_tests.atomic_json") as write:
+                self.api.request.return_value = {"rt": {"courseId": "course"}}
+                self.api.request.side_effect = None
+                result = run_chapter_cli(self.client, action, ["course-key"], output=Mock())
+                from chapter_tests import chapter_result
+                self.assertEqual(chapter_result(result)[0], "没有未交测试")
+                solver.assert_not_called()
+                write.assert_not_called()
+        self.api.open_paper.assert_not_called()
+        self.api.save_answer.assert_not_called()
+        self.api.submit_paper.assert_not_called()
+
+    def test_empty_list_menu_shows_no_pending_work_instead_of_failure(self):
+        from terminal_ui import BACK_CODE
+        self.api.list_tests.return_value = []
+        keys = iter(["enter", "enter", "enter", "back", "back"])
+        with patch("chapter_tests.sys.stdin.isatty", return_value=True), \
+             patch("chapter_tests.ChapterAPI.from_client", return_value=self.api), \
+             patch("terminal_ui.read_menu_key", side_effect=lambda: next(keys)), \
+             redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(run_chapter_cli(self.client, "menu"), BACK_CODE)
+        self.assertIn("当前课程没有未交测试/作业。", output.getvalue())
+        self.assertNotIn("操作未完成", output.getvalue())
+        self.api.open_paper.assert_not_called()
+
     def test_list_never_opens_or_answers_a_paper(self):
         with patch("chapter_tests.ChapterAPI.from_client", return_value=self.api), \
              patch("chapter_tests.atomic_json") as write, patch("builtins.print"):
@@ -362,8 +547,96 @@ class CliTests(unittest.TestCase):
              patch("chapter_tests.atomic_json"), patch("chapter_tests.AISolver"), \
              patch("chapter_tests.ChapterRunner") as runner, patch("builtins.print"):
             run_chapter_cli(self.client, "answer", ["course-key"], "student-exam", {"enabled": True})
-        runner.return_value.run.assert_called_once_with(self.api.open_paper.return_value, submit=False)
+        runner.return_value.run.assert_called_once_with(self.api.open_paper.return_value, submit=False, meeting=False, homework=False)
         self.client.fuckCourse.assert_not_called()
+
+    def test_meeting_from_list_runs_full_save_and_verification_flow(self):
+        self.api.list_tests.return_value[0]["meetCourseType"] = "1"
+        self.api.open_paper.return_value = meeting_paper()
+        self.api.read_answers.side_effect = [{}, {"q1": {"answer": "option-91"}}]
+        with patch("chapter_tests.ChapterAPI.from_client", return_value=self.api), \
+             patch("chapter_tests.atomic_json") as write, \
+             patch("chapter_tests.AISolver", return_value=lambda q: ["option-91"]), \
+             patch("builtins.print"):
+            result = run_chapter_cli(self.client, "answer", ["course-key"], "student-exam", {})
+        self.assertEqual(result["status"], "saved")
+        self.assertEqual(result["kind"], "meeting")
+        self.api.save_answer.assert_called_once()
+        self.assertEqual(self.api.save_answer.call_args.args[0], CONTEXT)
+        self.assertEqual(self.api.read_answers.call_count, 2)
+        self.api.submit_paper.assert_not_called()
+        self.assertEqual(write.call_args_list[0].args[1]["kind"], "meeting")
+
+    def test_meeting_can_be_exported_without_calling_ai_or_save(self):
+        self.api.list_tests.return_value[0]["meetCourseType"] = 1
+        self.api.open_paper.return_value = meeting_paper()
+        with patch("chapter_tests.ChapterAPI.from_client", return_value=self.api), \
+             patch("chapter_tests.atomic_json"), patch("chapter_tests.AISolver") as solver, \
+             patch("builtins.print"):
+            result = run_chapter_cli(self.client, "export", ["course-key"], "student-exam")
+        self.assertEqual(result["kind"], "meeting")
+        self.assertEqual(result["count"], 1)
+        solver.assert_not_called()
+        self.api.save_answer.assert_not_called()
+
+    def test_mixed_batch_runs_cli_and_runner_for_all_ordinary_homework(self):
+        self.api.list_tests.return_value = [
+            {"id": "chapter", "examId": "exam-1", "examName": "第一章", "chapterId": 7},
+            {"id": "meeting", "examId": "exam-2", "examName": "茶与健康", "meetCourseType": 1},
+            {"id": "other", "examId": "exam-3", "examName": "test"},
+            {"id": "peer", "examName": "互评", "reviewType": 1}]
+        self.api.request.side_effect = lambda endpoint, payload: {
+            "rt": {"courseId": "course"} if endpoint == "exam/getSingleRecruit" else {"schoolId": "school"}}
+        self.api.open_paper.side_effect = lambda context: paper() if context.student_exam_id == "chapter" else meeting_paper()
+        self.api.read_answers.side_effect = [{}, {"q1": {"answer": "option-91"}}, {}, {"q1": {"answer": "option-91"}}, {}, {"q1": {"answer": "option-91"}}]
+        with patch("chapter_tests.ChapterAPI.from_client", return_value=self.api), \
+             patch("chapter_tests.atomic_json"), \
+             patch("chapter_tests.AISolver", return_value=lambda q: ["option-91"]), \
+             patch("builtins.print"):
+            result = run_chapter_cli(self.client, "answer", ["course-key"], ai_config={}, all_tests=True)
+        self.assertEqual([i["status"] for i in result["items"]], ["saved", "saved", "saved", "skipped"])
+        self.assertEqual([c.args[0].student_exam_id for c in self.api.save_answer.call_args_list], ["chapter", "meeting", "other"])
+        self.assertEqual(self.api.read_answers.call_count, 6)
+        self.api.submit_paper.assert_not_called()
+
+    def test_peer_review_is_rejected_even_when_marked_as_meeting(self):
+        self.api.list_tests.return_value[0].update(meetCourseType=1, reviewType=1)
+        with patch("chapter_tests.ChapterAPI.from_client", return_value=self.api), \
+             patch("builtins.print"), self.assertRaisesRegex(UnsupportedChapter, "互评"):
+            run_chapter_cli(self.client, "answer", ["course-key"], "student-exam")
+        self.api.open_paper.assert_not_called()
+        self.api.save_answer.assert_not_called()
+
+    def test_ordinary_homework_without_chapter_or_meeting_marker_is_answered(self):
+        self.api.list_tests.return_value[0]["examName"] = "test"
+        self.api.open_paper.return_value = meeting_paper()
+        self.api.read_answers.side_effect = [{}, {"q1": {"answer": "option-91"}}]
+        with patch("chapter_tests.ChapterAPI.from_client", return_value=self.api), \
+             patch("chapter_tests.atomic_json"), patch("chapter_tests.AISolver", return_value=lambda q: ["option-91"]), \
+             patch("builtins.print"):
+            result = run_chapter_cli(self.client, "answer", ["course-key"], "student-exam")
+        self.assertEqual((result["status"], result["kind"]), ("saved", "other"))
+        self.api.save_answer.assert_called_once()
+        self.assertEqual(self.api.read_answers.call_count, 2)
+        self.api.submit_paper.assert_not_called()
+
+    def test_ordinary_homework_can_be_submitted_and_confirmed(self):
+        self.api.open_paper.side_effect = [meeting_paper(), {"state": 4}]
+        self.api.read_answers.side_effect = [{}, {"q1": {"answer": "option-91"}}, {"q1": {"answer": "option-91"}}]
+        self.api.submit_paper.return_value = {"statu": 1}
+        with patch("chapter_tests.ChapterAPI.from_client", return_value=self.api), \
+             patch("chapter_tests.atomic_json"), patch("chapter_tests.AISolver", return_value=lambda q: ["option-91"]):
+            result = run_chapter_cli(self.client, "answer", ["course-key"], "student-exam", submit=True, output=Mock())
+        self.assertEqual((result["status"], result["kind"]), ("submitted", "other"))
+        self.api.submit_paper.assert_called_once_with(CONTEXT, 1)
+
+    def test_ordinary_homework_with_unsupported_questions_is_reported_before_model_call(self):
+        self.api.open_paper.return_value = meeting_paper(raw_question(kind=3))
+        with patch("chapter_tests.ChapterAPI.from_client", return_value=self.api), \
+             patch("chapter_tests.AISolver") as solver, self.assertRaises(UnsupportedChapter):
+            run_chapter_cli(self.client, "answer", ["course-key"], "student-exam", _batch=True, output=Mock())
+        solver.assert_not_called()
+        self.api.save_answer.assert_not_called()
 
     def test_missing_or_foreign_test_id_does_not_open_any_paper(self):
         with patch("chapter_tests.ChapterAPI.from_client", return_value=self.api), \
@@ -385,9 +658,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("未交测试列表", output.getvalue())
         self.assertIn("题目导出完成", output.getvalue())
         self.assertIn("返回上一页", output.getvalue())
-        self.assertGreaterEqual(output.getvalue().count("选择一份章节测试"), 2)
+        self.assertGreaterEqual(output.getvalue().count("选择要处理的测试"), 2)
         self.assertIn("返回课程列表", output.getvalue())
-        self.assertIn("返回主菜单", output.getvalue())
+        self.assertIn("返回功能选择", output.getvalue())
+        self.assertIn("AI 做题", output.getvalue())
         self.client.login.assert_not_called()
         self.api.save_answer.assert_not_called()
 
@@ -410,14 +684,59 @@ class BatchAndSelectionTests(unittest.TestCase):
         self.course = {"secret": "fake-course", "courseName": "跨文化英语"}
         self.item = {"id": "paper-1", "examId": "exam-1", "examName": "第一章测试", "chapterId": 7}
 
-    def test_batch_skips_unrelated_items_and_defaults_to_save_only(self):
+    def test_batch_includes_other_homework_and_defaults_to_save_only(self):
         items = [{"id": "other", "examName": "test"}, self.item,
-                 {**self.item, "id": "meeting", "meetCourseType": 1}]
+                 {"id": "meeting", "examName": "见面课测验", "meetCourseType": 1},
+                 {**self.item, "id": "peer", "meetCourseType": 1, "reviewType": 1}]
         with patch("chapter_tests.atomic_json"), patch("chapter_tests.run_chapter_cli", return_value={"status": "saved", "progress": "fake.json"}) as run:
             result = run_chapter_batch(self.client, self.course, items, {}, output=Mock())
-        self.assertEqual([i["status"] for i in result["items"]], ["skipped", "saved", "skipped"])
+        self.assertEqual([i["status"] for i in result["items"]], ["saved", "saved", "saved", "skipped"])
+        self.assertEqual([c.args[3] for c in run.call_args_list], ["other", "paper-1", "meeting"])
+        self.assertEqual(result["items"][2]["kind"], "meeting")
         self.assertFalse(run.call_args.kwargs["submit"])
         self.assertEqual(result["status"], "batch_completed")
+
+    def test_batch_with_skipped_work_does_not_claim_everything_completed(self):
+        from chapter_tests import chapter_result
+        result = {"status": "batch_completed", "course": "课程", "items": [
+            {"name": "互评", "kind": "peer", "status": "skipped", "reason": "独立流程"}],
+            "remaining": 0, "submit": False, "progress": "fake.json"}
+        title, notes = chapter_result(result)
+        self.assertIn("有未完成作业", title)
+        self.assertIn("跳过 1 份", notes[1])
+
+    def test_empty_selection_displays_normal_result_and_returns(self):
+        for action in ("export", "answer"):
+            with self.subTest(action=action), \
+                 patch("chapter_tests.run_chapter_cli", return_value={"status": "listed", "tests": []}) as run, \
+                 patch("chapter_tests.choose_item") as choose, patch("terminal_ui.show_page"), \
+                 patch("terminal_ui.show_result_page") as result:
+                run_chapter_selection(self.client, self.course, action, {})
+                self.assertEqual(result.call_args.args[1], "没有未交测试")
+                self.assertIn("当前课程没有未交测试/作业。", result.call_args.args[2])
+                choose.assert_not_called()
+                run.assert_called_once()
+
+    def test_meeting_is_recognized_with_integer_or_string_marker(self):
+        for marker in (1, "1"):
+            self.assertEqual(homework_kind({"meetCourseType": marker}), "meeting")
+        self.assertEqual(homework_kind({"examName": "见面课测验"}), "other")
+
+    def test_meeting_selection_displays_type_and_defaults_to_save_only(self):
+        item = {"id": "meeting", "examName": "茶与健康", "meetCourseType": 1}
+        listing = {"status": "listed", "tests": [item]}
+        result = {"status": "saved", "exam": "茶与健康", "kind": "meeting", "count": 1,
+                  "destination": "fake.json", "progress": "progress.json"}
+        keys = iter(["enter", "enter", "enter", "back"])
+        with patch("chapter_tests.sys.stdin.isatty", return_value=True), \
+             patch("terminal_ui.read_menu_key", side_effect=lambda: next(keys)), \
+             patch("chapter_tests.run_chapter_cli", side_effect=[listing, result, listing]) as run, \
+             redirect_stdout(io.StringIO()) as output:
+            run_chapter_selection(self.client, self.course, "answer", {})
+        self.assertIn("[见面课] 茶与健康", output.getvalue())
+        self.assertIn("提交后不可重做", output.getvalue())
+        self.assertIn("类型：见面课", output.getvalue())
+        self.assertFalse(run.call_args_list[1].kwargs["submit"])
 
     def test_batch_submit_choice_is_forwarded_to_each_test(self):
         with patch("chapter_tests.atomic_json"), patch("chapter_tests.run_chapter_cli", return_value={"status": "submitted", "progress": "fake.json"}) as run:

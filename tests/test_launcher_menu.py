@@ -20,6 +20,12 @@ class LauncherMenuTests(unittest.TestCase):
         self.assertIn("› 账号密码登录", output)
         self.assertTrue(output.endswith("\033[0m\033[?25h"))
 
+    def test_home_has_login_and_settings_without_separate_feature_login(self):
+        self.assertEqual(TITLES, ("账号密码登录", "扫码登录", "配置 AI 做题", "配置飞书通知", "测试飞书通知", "退出助手"))
+        _, output = self.select(["enter"])
+        self.assertNotIn("滑块", output)
+        self.assertNotIn("章节测试", output)
+
     def test_down_selects_each_action(self):
         for steps in range(1, len(TITLES)):
             with self.subTest(steps=steps):

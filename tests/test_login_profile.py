@@ -115,8 +115,16 @@ class LoginProfileTests(unittest.TestCase):
             self.assertEqual(load_profile(path), self.saved)
             self.assertEqual([p.name for p in Path(folder).iterdir()], ["login_profile.json"])
 
-    def run_main(self, answer, mismatched_cookie=False, fail_login=False):
+    def run_main(self, answer, mismatched_cookie=False, fail_login=False, interactive=False,
+                 exam_expired=False, fail_exam=False, use_qr=False):
         events = []
+        def authenticate_exam(client):
+            from chapter_tests import ChapterError
+            attempts = sum(e[0] == "exam-auth" for e in events)
+            events.append(("exam-auth", client))
+            if fail_exam or (exam_expired and attempts == 0):
+                raise ChapterError("fake expired CAS ticket")
+            client.cookies.set("JSESSIONID", "verified-exam", domain="studentexam-api.zhihuishu.com")
 
         class FakeClient:
             def __init__(self, **kwargs):
@@ -139,13 +147,14 @@ class LoginProfileTests(unittest.TestCase):
             def getHikeList(self): return []
             def getZhidaoAiList(self): return []
 
-            def login(self, username, password, **kwargs):
+            def login(self, username=None, password=None, **kwargs):
                 events.append(("login", username, password))
                 if fail_login:
                     raise ValueError("fake invalid password")
                 self._cookies = cookies_for("fake-bob-id" if username == "fake-bob" else "fake-alice-id")
 
-            def fuckCourse(self, **kwargs): pass
+            def fuckCourse(self, **kwargs):
+                events.append(("video", self, kwargs))
 
         with test_directory() as folder:
             directory = Path(folder)
@@ -165,16 +174,23 @@ class LoginProfileTests(unittest.TestCase):
             with patch.dict(sys.modules, {"fucker": fake_module, "logger": fake_logger}), \
                  patch("utils.getConfigPath", return_value=str(directory / "config.json")), \
                  patch("utils.getRealPath", side_effect=lambda name: str(directory / Path(name).name)), \
-                 patch.object(sys, "argv", ["main.py", "--password-login", "-c", "fake-course"]), \
+                 patch.object(sys, "argv", ["main.py", "-q" if use_qr else "--password-login", "-c", "fake-course"] + (["--interactive-menu"] if interactive else [])), \
                  patch("login_profile._read_menu_key", side_effect=keys), \
+                 patch("study_session.select_menu", side_effect=[1, 0, 1, 2]), \
+                 patch("study_session.show_page"), patch("study_session.show_result_page"), \
+                 patch("chapter_tests.run_chapter_cli", side_effect=lambda client, *a, **kw: events.append(("questions", client))), \
+                 patch("chapter_tests.ChapterAPI.from_client", side_effect=lambda client: Mock(authenticate=lambda: authenticate_exam(client))), \
                  patch("builtins.input", return_value="fake-bob"), \
                  patch("getpass.getpass", return_value="fake-new-password"), patch("builtins.print"):
-                if fail_login or answer == "back":
+                if fail_login or fail_exam or answer == "back" or interactive:
                     with self.assertRaises(SystemExit) as stopped:
                         runpy.run_path(str(ROOT / "main.py"), run_name="__main__")
-                    self.assertEqual(stopped.exception.code, BACK_CODE if answer == "back" else 1)
+                    self.assertEqual(stopped.exception.code, BACK_CODE if answer == "back" or (interactive and not fail_login and not fail_exam) else 1)
                 else:
                     runpy.run_path(str(ROOT / "main.py"), run_name="__main__")
+            if interactive and not fail_exam and answer != "back":
+                saved_cookies = utils.list_to_cookie_jar(json.loads((directory / "cookies.json").read_text(encoding="utf-8")))
+                self.assertEqual(saved_cookies.get("JSESSIONID"), "verified-exam")
             return events, load_profile(directory / "login_profile.json")
 
     def test_main_reuses_session_without_asking_for_password_again(self):
@@ -182,6 +198,36 @@ class LoginProfileTests(unittest.TestCase):
         self.assertIn(("load-cookies",), events)
         self.assertFalse(any(e[0] == "login" for e in events))
         self.assertEqual(saved["username"], "fake-alice")
+
+    def test_interactive_features_share_one_fresh_login_and_client(self):
+        events, _ = self.run_main("2", interactive=True)
+        self.assertEqual(sum(e[0] == "login" for e in events), 1)
+        feature_events = [e for e in events if e[0] in ("questions", "video")]
+        self.assertEqual([e[0] for e in feature_events], ["questions", "video", "questions"])
+        self.assertTrue(all(e[1] is feature_events[0][1] for e in feature_events))
+
+    def test_interactive_features_reuse_cached_login(self):
+        events, _ = self.run_main("1", interactive=True)
+        self.assertFalse(any(e[0] == "login" for e in events))
+        self.assertEqual(sum(e[0] == "questions" for e in events), 2)
+
+    def test_expired_cas_is_renewed_before_entering_features(self):
+        events, _ = self.run_main("1", interactive=True, exam_expired=True)
+        self.assertEqual(sum(e[0] == "login" for e in events), 1)
+        self.assertEqual(sum(e[0] == "exam-auth" for e in events), 2)
+        self.assertLess(next(i for i, e in enumerate(events) if e[0] == "login"),
+                        next(i for i, e in enumerate(events) if e[0] == "questions"))
+
+    def test_qr_login_also_establishes_exam_login_before_features(self):
+        events, _ = self.run_main("2", interactive=True, use_qr=True)
+        self.assertEqual(sum(e[0] == "login" for e in events), 1)
+        self.assertLess(next(i for i, e in enumerate(events) if e[0] == "exam-auth"),
+                        next(i for i, e in enumerate(events) if e[0] == "questions"))
+
+    def test_failed_exam_login_never_enters_features_or_replaces_profile(self):
+        events, saved = self.run_main("2", interactive=True, fail_exam=True)
+        self.assertFalse(any(e[0] in ("questions", "video") for e in events))
+        self.assertEqual(saved, self.saved)
 
     def test_main_switches_account_and_saves_new_password_only_after_success(self):
         events, saved = self.run_main("2")

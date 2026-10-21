@@ -1,4 +1,4 @@
-"""Shared-course chapter homework with explicit save-only or submit modes.
+"""Shared-course homework with save-only or submit modes.
 
 Protocol checked against the public stuExamWeb scripts on 2026-10-20.
 Submission is opt-in and requires a final server readback of every answer.
@@ -13,12 +13,13 @@ from pathlib import Path
 import re
 import sys
 import tempfile
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
 import requests
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 from Crypto.Util.Padding import pad
+from login_profile import cookie_account_id
 
 
 API_ROOT = "https://studentexam-api.zhihuishu.com/studentExam/gateway/t/v1/"
@@ -36,6 +37,22 @@ class ChapterError(RuntimeError):
 
 class UnsupportedChapter(ChapterError):
     """A batch item cannot be handled by the supported text-choice workflow."""
+
+
+def homework_kind(item):
+    """Classify official homework-list metadata; peer review takes precedence."""
+    if str(item.get("reviewType")) == "1":
+        return "peer"
+    if str(item.get("meetCourseType")) == "1":
+        return "meeting"
+    return "chapter" if item.get("chapterId") else "other"
+
+
+KIND_LABELS = {"chapter": "章节测试", "meeting": "见面课", "peer": "互评", "other": "其他作业"}
+
+
+def homework_label(item):
+    return f"[{KIND_LABELS[homework_kind(item)]}] {item.get('examName', '未命名测试')}"
 
 
 def compact_json(value):
@@ -70,6 +87,12 @@ class ChapterAPI:
 
     @classmethod
     def from_client(cls, client):
+        # Video methods replace client.session.cookies with course-specific copies.
+        # Keep the exam session separate and reuse its verified service cookies.
+        cached = client.__dict__.get("_chapter_api")
+        account_id = cookie_account_id(client.cookies)
+        if cached is not None and cached.account_id == account_id:
+            return cached
         session = requests.Session()
         session.cookies.update(client.cookies)
         session.cookies.update(client.session.cookies)
@@ -77,25 +100,42 @@ class ChapterAPI:
         session.headers.update({"User-Agent": client.headers.get("User-Agent", "Mozilla/5.0"),
                                 "Origin": "https://onlineexamh5new.zhihuishu.com",
                                 "Referer": "https://onlineexamh5new.zhihuishu.com/"})
-        return cls(session)
+        api = cls(session)
+        api.client = client
+        api.account_id = account_id
+        client._chapter_api = api
+        return api
 
     def authenticate(self):
         """Complete the same CAS service redirect as the official homework page."""
+        # Capture the chosen account before following redirects that can replace
+        # CAS cookies. An existing exam session may outlive its CAS ticket.
+        expected = getattr(self, "account_id", cookie_account_id(self.session.cookies))
+        if not expected:
+            raise ChapterError("无法核对 AI 做题登录账号，请返回登录首页重新登录。")
+        info = self.request("ulogin/getLoginUserInfo", {}).get("rt")
+        if isinstance(info, dict) and info.get("uuid"):
+            self._confirm_account(info, expected)
+            return
         response = self.session.get(
             "https://studentexam-api.zhihuishu.com/studentExam/gateway/f/v1/gologin/login",
             params={"fromurl": "https://onlineexamh5new.zhihuishu.com/stuExamWeb.html"}, timeout=15)
         response.raise_for_status()
         if urlsplit(response.url).hostname not in ("onlineexamh5new.zhihuishu.com", "studentexam-api.zhihuishu.com"):
-            raise ChapterError("章节测试登录已失效，请重新扫码登录后再试。")
+            raise ChapterError("课程登录仍可用，但 AI 做题的单点登录已失效，请返回登录首页重新登录。")
         # The current CAS callback may finish on a user-management HTML page.
         # Verify the account through the API instead of treating that URL as failure.
         info = self.request("ulogin/getLoginUserInfo", {}).get("rt")
-        try:
-            expected = json.loads(unquote(self.session.cookies.get("CASLOGC", ""))).get("uuid")
-        except (ValueError, AttributeError, requests.cookies.CookieConflictError) as exc:
-            raise ChapterError("无法核对章节测试登录账号。") from exc
-        if not isinstance(info, dict) or not expected or str(info.get("uuid")) != str(expected):
-            raise ChapterError("章节测试登录账号未确认，请重新登录。")
+        self._confirm_account(info, expected)
+
+    def _confirm_account(self, info, expected):
+        if (not isinstance(info, dict) or info.get("loginstatus") is False or not expected
+                or str(info.get("uuid")) != str(expected)
+                or cookie_account_id(self.session.cookies) != expected):
+            raise ChapterError("AI 做题登录账号未确认，请返回登录首页重新登录。")
+        if getattr(self, "client", None) is not None:
+            # Persist only a verified service login. Do not replace video headers.
+            self.client.cookies.update(self.session.cookies)
 
     @staticmethod
     def decode_response(response):
@@ -141,9 +181,15 @@ class ChapterAPI:
             data = self.request("student/getStudentHomework", {
                 "recruitId": recruit_id, "courseId": course_id, "flag": 1, "pageSize": 100, "pageNum": page})
             result = data.get("rt")
-            if not isinstance(result, dict) or not isinstance(result.get("studentHomeworkList"), list):
+            if not isinstance(result, dict):
                 raise ChapterError("测试列表格式发生变化，未继续请求。")
-            batch = result["studentHomeworkList"]
+            batch = result.get("studentHomeworkList")
+            # The official API omits the list when there are no pending items.
+            # Only an explicit terminal page establishes that this means empty.
+            if batch is None and str(result.get("next")) == "-1":
+                batch = []
+            if not isinstance(batch, list):
+                raise ChapterError("测试列表格式发生变化，未继续请求。")
             for item in batch:
                 item_id = str(item.get("id", ""))
                 if not item_id or item_id in seen:
@@ -331,14 +377,16 @@ class ChapterRunner:
         self.api, self.context, self.solve = api, context, solve
         self.report_path, self.output = Path(report_path), output
 
-    def run(self, paper, *, submit=False):
+    def run(self, paper, *, submit=False, meeting=False, homework=False):
         if str(paper.get("state")) in ("3", "4"):
             raise ChapterError("试卷已提交或已结束，未修改答案。")
-        if not paper.get("examBase", {}).get("chapterId"):
-            raise ChapterError("此试卷没有章节标识，未按章节测试自动作答。")
+        # Nonchapter homework must also come from the authenticated homework list.
+        if not (meeting or homework) and not paper.get("examBase", {}).get("chapterId"):
+            raise ChapterError("未确认此试卷属于当前账号的作业列表，未自动作答。")
         questions = parse_questions(paper)
         existing = self.api.read_answers(self.context, [q.id for q in questions])
-        report = {"context": asdict(self.context), "status": "running", "questions": {}, "submitted": False}
+        report = {"context": asdict(self.context), "kind": "meeting" if meeting else "other" if homework else "chapter",
+                  "status": "running", "questions": {}, "submitted": False}
         atomic_json(self.report_path, report)
         for index, question in enumerate(questions, 1):
             row = {"status": "pending", "question": asdict(question)}
@@ -444,13 +492,13 @@ class AISolver:
         return validate_answers(question, self.model.generateAnswer(prompt))
 
 
-def choose_item(title, items, label, *, back_label="返回上一级"):
+def choose_item(title, items, label, *, back_label="返回上一级", notes=()):
     from terminal_ui import MenuBack, select_menu
     if not sys.stdin.isatty():
         raise ChapterError("非交互运行时，请使用 -c 指定课程，并使用 --chapter-exam 指定测试。")
     titles = [label(item) for item in items] + [back_label]
-    selected = select_menu(title, "↑ ↓ 选择，Enter 确认", titles,
-                           back_index=len(items))
+    selected = select_menu("AI 做题", title, titles,
+                           back_index=len(items), notes=notes)
     if selected == len(items):
         raise MenuBack
     return items[selected]
@@ -469,7 +517,7 @@ def run_chapter_cli(client, action, courses=None, exam_id=None, ai_config=None, 
     available = client.getZhidaoList()
     if courses:
         if len(courses) != 1:
-            raise ChapterError("章节测试一次处理一门共享课，请只指定一个课程 ID。")
+            raise ChapterError("AI 做题一次处理一门共享课，请只指定一个课程 ID。")
         matches = [c for c in available if str(c.get("secret")) == str(courses[0])]
         if len(matches) != 1:
             raise ChapterError("指定课程不在当前账号的共享课列表中。")
@@ -477,7 +525,7 @@ def run_chapter_cli(client, action, courses=None, exam_id=None, ai_config=None, 
     else:
         if not available:
             raise ChapterError("当前账号没有可用共享课。")
-        course = choose_item("选择章节测试课程", available, lambda c: c.get("courseName", "未命名课程"))
+        course = choose_item("选择 AI 做题课程", available, lambda c: c.get("courseName", "未命名课程"))
     ctx = client.getZhidaoContext(course["secret"])
     api = ChapterAPI.from_client(client)
     api.authenticate()
@@ -489,7 +537,7 @@ def run_chapter_cli(client, action, courses=None, exam_id=None, ai_config=None, 
     if show_listing:
         output(f"课程：{course['courseName']}；未交测试/作业：{len(tests)}")
         for item in tests:
-            output(f"  {item.get('id')}  {item.get('examName', '未命名测试')}")
+            output(f"  {item.get('id')}  {homework_label(item)}")
     if action == "list" or not tests:
         return {"course": course["courseName"], "tests": tests, "status": "listed"}
     if all_tests:
@@ -505,10 +553,11 @@ def run_chapter_cli(client, action, courses=None, exam_id=None, ai_config=None, 
             raise ChapterError("指定测试不在该课程的未交列表中。")
         item = matches[0]
     else:
-        item = choose_item("选择一份章节测试", tests, lambda t: t.get("examName", "未命名测试"),
-                           back_label="返回章节操作")
-    if str(item.get("meetCourseType")) == "1" or str(item.get("reviewType")) == "1":
-        raise ChapterError("此项是见面课或互评作业，当前章节测试入口不支持。")
+        item = choose_item("选择要处理的测试", tests, homework_label,
+                           back_label="返回做题操作")
+    kind = homework_kind(item)
+    if kind == "peer":
+        raise UnsupportedChapter("此项是互评作业，当前 AI 做题入口不支持。")
     school = api.request("exam/getLoginSchoolInfo", {}).get("rt")
     school_id = (school or {}).get("schoolId") if isinstance(school, dict) else None
     if not school_id or not item.get("examId") or not item.get("id"):
@@ -516,6 +565,8 @@ def run_chapter_cli(client, action, courses=None, exam_id=None, ai_config=None, 
     context = PaperContext(str(recruit_id), str(item.get("courseId") or recruit["courseId"]),
                            str(item["id"]), str(item["examId"]), str(school_id))
     paper = api.open_paper(context)
+    if kind == "other" and paper.get("examBase", {}).get("chapterId"):
+        kind = "chapter"
     questions = parse_questions(paper)
     if _batch:
         for question in questions:
@@ -524,15 +575,16 @@ def run_chapter_cli(client, action, courses=None, exam_id=None, ai_config=None, 
     paper_key = sha256(compact_json(asdict(context)).encode()).hexdigest()[:16]
     folder = Path(__file__).resolve().parent / "chapter_test_data" / account / paper_key
     destination = folder / "questions.json"
-    atomic_json(destination, {"course_name": course["courseName"], "exam_name": item.get("examName"),
+    atomic_json(destination, {"course_name": course["courseName"], "exam_name": item.get("examName"), "kind": kind,
                               "context": asdict(context), "questions": [asdict(q) for q in questions]})
     output(f"已拉取 {len(questions)} 道题，题目文件：{destination}")
-    result = {"course": course["courseName"], "exam": item.get("examName"),
+    result = {"course": course["courseName"], "exam": item.get("examName"), "kind": kind,
               "count": len(questions), "destination": str(destination), "status": "exported"}
     if action == "export":
         return result
     solver = AISolver(client, ai_config or {}, course["courseName"])
-    report = ChapterRunner(api, context, solver, folder / "progress.json", output=output).run(paper, submit=submit)
+    report = ChapterRunner(api, context, solver, folder / "progress.json", output=output).run(
+        paper, submit=submit, meeting=kind == "meeting", homework=kind == "other")
     output("答案已保存并确认交卷。" if submit else "答案已保存；已有答案保持不变。尚未交卷。")
     result = {**result, "status": "submitted" if submit else "saved", "progress": str(folder / "progress.json")}
     if isinstance(report, dict) and report.get("score") is not None:
@@ -541,7 +593,7 @@ def run_chapter_cli(client, action, courses=None, exam_id=None, ai_config=None, 
 
 
 def run_chapter_batch(client, course, tests, ai_config, *, submit=False, output=print):
-    """Run the current course's ordinary chapter tests, journaling each result."""
+    """Run every ordinary homework item, journaling each result."""
     account = sha256(str(client.uuid).encode()).hexdigest()[:16]
     course_key = sha256(str(course["secret"]).encode()).hexdigest()[:16]
     path = Path(__file__).resolve().parent / "chapter_test_data" / account / course_key / "batch-progress.json"
@@ -549,13 +601,14 @@ def run_chapter_batch(client, course, tests, ai_config, *, submit=False, output=
               "status": "running", "items": [], "remaining": 0}
     atomic_json(path, report)
     for index, item in enumerate(tests):
-        entry = {"id": str(item.get("id", "")), "name": item.get("examName", "未命名测试")}
+        kind = homework_kind(item)
+        entry = {"id": str(item.get("id", "")), "name": item.get("examName", "未命名测试"), "kind": kind}
         report["items"].append(entry)
-        if not item.get("chapterId") or str(item.get("meetCourseType")) == "1" or str(item.get("reviewType")) == "1":
-            entry.update(status="skipped", reason="不是普通章节测试")
+        if kind == "peer":
+            entry.update(status="skipped", reason="互评作业使用独立流程，当前尚不支持自动处理")
             atomic_json(path, report)
             continue
-        output(f"批量 {index+1}/{len(tests)}：{entry['name']}")
+        output(f"批量 {index+1}/{len(tests)}：{homework_label(item)}")
         try:
             result = run_chapter_cli(client, "answer", [course["secret"]], entry["id"], ai_config,
                                      submit=submit, output=output, show_listing=False, _batch=True)
@@ -583,6 +636,12 @@ ALL_TESTS = "__all_chapters__"
 
 def chapter_result(result):
     """Return user-facing result content for a single test or a batch."""
+    if result["status"] == "listed":
+        tests = result["tests"]
+        if not tests:
+            return "没有未交测试", ["当前课程没有未交测试/作业。"]
+        return "未交测试列表", [f"共 {len(tests)} 项未交测试/作业"] + [
+            f"{i}. {homework_label(t)}" for i, t in enumerate(tests, 1)]
     if result["status"].startswith("batch_"):
         items = result["items"]
         done = sum(i["status"] in ("saved", "submitted") for i in items)
@@ -592,11 +651,16 @@ def chapter_result(result):
                  "模式：保存并提交" if result["submit"] else "模式：仅保存（未交卷）"]
         for item in items:
             state = {"saved": "已保存", "submitted": "已提交", "skipped": "跳过", "failed": "失败"}[item["status"]]
-            notes.append(f"{item['name']}：{state}" + (f"（{item.get('reason') or item.get('error')}）" if item.get("reason") or item.get("error") else ""))
+            label = f"[{KIND_LABELS[item['kind']]}] " if item.get("kind") in KIND_LABELS else ""
+            notes.append(f"{label}{item['name']}：{state}" + (f"（{item.get('reason') or item.get('error')}）" if item.get("reason") or item.get("error") else ""))
         notes += ["批量记录：", result["progress"]]
-        return ("批量处理完成" if result["status"] == "batch_completed" else "批量处理已停止"), notes
+        subtitle = "批量处理已停止" if result["status"] == "batch_stopped" else (
+            "批量处理结束（有未完成作业）" if skipped or failed or result["remaining"] else "批量处理完成")
+        return subtitle, notes
     subtitle = {"exported": "题目导出完成", "saved": "逐题保存完成", "submitted": "保存并提交完成"}[result["status"]]
     notes = [f"测试：{result['exam']}", f"题目数量：{result['count']}", "题目文件：", result["destination"]]
+    if result.get("kind") in KIND_LABELS:
+        notes.insert(1, f"类型：{KIND_LABELS[result['kind']]}")
     if result["status"] in ("saved", "submitted"):
         notes += ["答案已保存；已有答案保持不变。",
                   "服务器已确认交卷。" if result["status"] == "submitted" else "尚未交卷。", result["progress"]]
@@ -609,30 +673,36 @@ def run_chapter_selection(client, course, action, ai_config):
     """Results return to this test list; Esc on the list returns to operations."""
     from terminal_ui import MenuBack, show_page, show_result_page
     def progress(text):
-        show_page("章节测试", course["courseName"], (str(text),), footer="处理中 · Ctrl+C 中止并返回")
+        show_page("AI 做题", course["courseName"], (str(text),), footer="处理中 · Ctrl+C 中止并返回")
     while True:
         try:
             progress("正在读取测试列表，请稍候……")
             listing = run_chapter_cli(client, "list", [course["secret"]], output=progress, show_listing=False)
             tests = listing["tests"]
             if not tests:
-                show_result_page("章节测试", "没有未交测试", ("当前课程的未交列表为空。",), back_label="返回上一页")
+                subtitle, notes = chapter_result(listing)
+                show_result_page("AI 做题", subtitle, notes, back_label="返回上一页")
                 return
             choices = tests + ([ALL_TESTS] if action == "answer" else [])
-            item = choose_item("选择一份章节测试", choices,
-                               lambda t: "一键全做（当前课程全部章节）" if t == ALL_TESTS else t.get("examName", "未命名测试"),
+            item = choose_item("选择要处理的测试", choices,
+                               lambda t: "一键全做（全部作业）" if t == ALL_TESTS else homework_label(t),
                                back_label="返回上一页")
         except (MenuBack, KeyboardInterrupt):
             return
         except Exception as exc:
-            show_result_page("章节测试", "读取列表未完成", (str(exc),), back_label="返回上一页")
+            show_result_page("AI 做题", "读取列表未完成", (str(exc),), back_label="返回上一页")
             return
         submit = False
         if action == "answer":
             try:
+                notes = ()
+                if item == ALL_TESTS:
+                    notes = ("范围：当前课程未交列表中的全部作业，包括其他作业。", "特殊题型或互评流程未处理时会说明原因。", "见面课提交后不可重做，建议先仅保存并核对。")
+                elif homework_kind(item) == "meeting":
+                    notes = ("当前为见面课测验，提交后不可重做。", "建议先仅保存，在官网核对后再决定是否提交。")
                 mode = choose_item("选择完成方式", ["save", "submit"],
                                    lambda m: "仅保存（不交卷）" if m == "save" else "保存并提交（核对成功后交卷）",
-                                   back_label="返回上一页")
+                                   back_label="返回上一页", notes=notes)
                 submit = mode == "submit"
             except (MenuBack, KeyboardInterrupt):
                 continue
@@ -641,13 +711,13 @@ def run_chapter_selection(client, course, action, ai_config):
                                     None if item == ALL_TESTS else str(item["id"]), ai_config,
                                     submit=submit, all_tests=item == ALL_TESTS, output=progress, show_listing=False)
             subtitle, notes = chapter_result(result)
-            show_result_page("章节测试", subtitle, notes, back_label="返回上一页")
+            show_result_page("AI 做题", subtitle, notes, back_label="返回上一页")
         except MenuBack:
             continue
         except KeyboardInterrupt:
-            show_result_page("章节测试", "操作已中止", ("已保存的答案保留；交卷状态不确定时请查看官网。",), back_label="返回上一页")
+            show_result_page("AI 做题", "操作已中止", ("已保存的答案保留；交卷状态不确定时请查看官网。",), back_label="返回上一页")
         except Exception as exc:
-            show_result_page("章节测试", "操作未完成", (str(exc),), back_label="返回上一页")
+            show_result_page("AI 做题", "操作未完成", (str(exc),), back_label="返回上一页")
 
 
 def run_chapter_menu(client, courses=None, ai_config=None):
@@ -658,15 +728,15 @@ def run_chapter_menu(client, courses=None, ai_config=None):
         if courses:
             available = [c for c in available if str(c.get("secret")) in map(str, courses)]
         if not available:
-            show_result_page("章节测试", "没有可用共享课", ("当前账号或指定范围内没有共享课。",), back_label="返回主菜单")
+            show_result_page("AI 做题", "没有可用共享课", ("当前账号或指定范围内没有共享课。",), back_label="返回功能选择")
             return BACK_CODE
         try:
-            course = choose_item("选择章节测试课程", available, lambda c: c.get("courseName", "未命名课程"), back_label="返回主菜单")
+            course = choose_item("选择 AI 做题课程", available, lambda c: c.get("courseName", "未命名课程"), back_label="返回功能选择")
         except (MenuBack, KeyboardInterrupt):
             return BACK_CODE
         while True:
             try:
-                action = choose_item(f"章节测试 · {course['courseName']}", ["list", "export", "answer"],
+                action = choose_item(f"AI 做题 · {course['courseName']}", ["list", "export", "answer"],
                                      lambda mode: {"list": "查看未交测试列表", "export": "拉取并导出题目", "answer": "AI 自动答题"}[mode],
                                      back_label="返回课程列表")
             except (MenuBack, KeyboardInterrupt):
@@ -675,11 +745,11 @@ def run_chapter_menu(client, courses=None, ai_config=None):
                 run_chapter_selection(client, course, action, ai_config)
                 continue
             try:
-                show_page("章节测试", course["courseName"], ("正在读取测试信息，请稍候……",), footer="Ctrl+C 中止并返回")
+                show_page("AI 做题", course["courseName"], ("正在读取测试信息，请稍候……",), footer="Ctrl+C 中止并返回")
                 result = run_chapter_cli(client, "list", [course["secret"]], show_listing=False)
-                notes = [f"共 {len(result['tests'])} 项未交测试/作业"] + [f"{i}. {t.get('examName', '未命名测试')}" for i,t in enumerate(result["tests"],1)]
-                show_result_page("章节测试", "未交测试列表", notes, back_label="返回上一页")
+                subtitle, notes = chapter_result(result)
+                show_result_page("AI 做题", subtitle, notes, back_label="返回上一页")
             except (MenuBack, KeyboardInterrupt):
                 continue
             except Exception as exc:
-                show_result_page("章节测试", "操作未完成", (str(exc),), back_label="返回上一页")
+                show_result_page("AI 做题", "操作未完成", (str(exc),), back_label="返回上一页")

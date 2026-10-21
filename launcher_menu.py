@@ -3,29 +3,27 @@ import sys
 from terminal_ui import (SELECTED, display_width, build_panel as shared_panel,
                          render_panel, select_menu)
 
-OPTIONS = ("账号密码登录 / 使用上次账号", "配置飞书通知",
-           "测试飞书通知（发送一条测试消息）", "扫码登录", "章节测试", "配置章节 AI", "测试滑块验证", "退出")
-TITLES = ("账号密码登录", "配置飞书通知", "测试飞书通知", "扫码登录", "章节测试", "配置章节 AI", "测试滑块验证", "退出助手")
-DESCRIPTIONS = ("使用上次账号，或登录其他账号", "设置机器人地址与签名密钥",
-                "发送一条测试消息，确认提醒可达", "使用智慧树 / 知到扫描二维码",
-                "查看测试、导出题目或自动答题并选择是否提交", "设置模型接口与密钥",
-                "检查浏览器验证与滑块处理", "关闭启动菜单")
+TITLES = ("账号密码登录", "扫码登录", "配置 AI 做题", "配置飞书通知", "测试飞书通知", "退出助手")
+OPTIONS = TITLES
+DESCRIPTIONS = ("使用上次账号或更换账号，登录后选择功能", "使用智慧树 / 知到扫码，登录后选择功能",
+                "设置做题使用的模型接口与密钥", "设置机器人地址与签名密钥",
+                "发送一条测试消息，确认提醒可达", "关闭启动菜单")
 EXIT_INDEX = len(TITLES) - 1
 FOOTER = "↑ ↓ 切换   Enter 确认   Esc / Ctrl+C 退出"
 
 
 def build_panel(selected, width=76, compact=False):
-    return shared_panel("智慧树学习助手", "课程与通知，一处管理", TITLES, DESCRIPTIONS,
+    return shared_panel("智慧树学习助手", "统一登录 · 自动刷课 / AI 做题", TITLES, DESCRIPTIONS,
                         selected=selected, width=width, compact=compact, dense=compact, footer=FOOTER)
 
 
 def render_menu(selected):
-    return render_panel("智慧树学习助手", "课程与通知，一处管理", TITLES, DESCRIPTIONS,
+    return render_panel("智慧树学习助手", "统一登录 · 自动刷课 / AI 做题", TITLES, DESCRIPTIONS,
                         selected=selected, footer=FOOTER)
 
 
 def select_launcher_menu(*, key_reader=None, output=None):
-    return select_menu("智慧树学习助手", "课程与通知，一处管理", TITLES, DESCRIPTIONS,
+    return select_menu("智慧树学习助手", "统一登录 · 自动刷课 / AI 做题", TITLES, DESCRIPTIONS,
                        key_reader=key_reader, output=output, back_index=EXIT_INDEX, footer=FOOTER)
 
 

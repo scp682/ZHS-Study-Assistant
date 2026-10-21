@@ -9,12 +9,12 @@ set "MENU_MODE="
 set "RESULT=1"
 if /i "%~1"=="--check" set "CHECK_ONLY=1"
 if "%~1"=="" set "MENU_MODE=1"
-for %%A in (--setup-feishu --test-feishu --test-captcha --setup-chapter-ai) do if /i "%~1"=="%%A" set "MENU_MODE=1"
+for %%A in (--setup-feishu --test-feishu --setup-chapter-ai) do if /i "%~1"=="%%A" set "MENU_MODE=1"
 if /i "%~1"=="--chapter-tests" if /i "%~2"=="menu" set "MENU_MODE=1"
 pushd "%~dp0"
 if errorlevel 1 goto directory_error
 
-for %%F in (main.py requirements.txt notification_settings.py account_login.py launcher_menu.py terminal_ui.py chapter_tests.py chapter_ai_settings.py) do (
+for %%F in (main.py requirements.txt notification_settings.py account_login.py launcher_menu.py terminal_ui.py study_session.py chapter_tests.py chapter_ai_settings.py) do (
     if not exist "%%F" (
         echo [错误] 缺少 %%F，请保持项目文件完整。
         goto finish
@@ -85,9 +85,8 @@ if defined CHECK_ONLY (
 )
 if /i "%~1"=="--setup-feishu" goto feishu_setup
 if /i "%~1"=="--test-feishu" goto feishu_test
-if /i "%~1"=="--test-captcha" goto captcha_test
 if /i "%~1"=="--setup-chapter-ai" goto chapter_ai_setup
-if /i "%~1"=="--chapter-tests" if /i "%~2"=="menu" goto chapter_tests
+if /i "%~1"=="--chapter-tests" if /i "%~2"=="menu" goto study_login
 if defined MENU_MODE goto menu
 "%PYEXE%" -u "main.py" %*
 set "RESULT=%ERRORLEVEL%"
@@ -97,22 +96,20 @@ goto after_action
 "%PYEXE%" -u "launcher_menu.py"
 set "MENU_CHOICE=%ERRORLEVEL%"
 if "%MENU_CHOICE%"=="0" goto password_login
-if "%MENU_CHOICE%"=="1" goto feishu_setup
-if "%MENU_CHOICE%"=="2" goto feishu_test
-if "%MENU_CHOICE%"=="3" goto qr_login
-if "%MENU_CHOICE%"=="4" goto chapter_tests
-if "%MENU_CHOICE%"=="5" goto chapter_ai_setup
-if "%MENU_CHOICE%"=="6" goto captcha_test
-if "%MENU_CHOICE%"=="7" goto menu_exit
+if "%MENU_CHOICE%"=="1" goto qr_login
+if "%MENU_CHOICE%"=="2" goto chapter_ai_setup
+if "%MENU_CHOICE%"=="3" goto feishu_setup
+if "%MENU_CHOICE%"=="4" goto feishu_test
+if "%MENU_CHOICE%"=="5" goto menu_exit
 goto menu_error
 
 :password_login
-"%PYEXE%" -u "main.py" --password-login
+"%PYEXE%" -u "main.py" --password-login --interactive-menu
 set "RESULT=%ERRORLEVEL%"
 goto after_action
 
 :qr_login
-"%PYEXE%" -u "main.py" -q
+"%PYEXE%" -u "main.py" -q --interactive-menu
 set "RESULT=%ERRORLEVEL%"
 goto after_action
 
@@ -126,18 +123,13 @@ goto after_action
 set "RESULT=%ERRORLEVEL%"
 goto after_action
 
-:captcha_test
-"%PYEXE%" -u "account_login.py" --test-captcha
-set "RESULT=%ERRORLEVEL%"
-goto after_action
-
 :chapter_ai_setup
 "%PYEXE%" -u "chapter_ai_settings.py"
 set "RESULT=%ERRORLEVEL%"
 goto after_action
 
-:chapter_tests
-"%PYEXE%" -u "main.py" --chapter-tests menu
+:study_login
+"%PYEXE%" -u "main.py" --interactive-menu
 set "RESULT=%ERRORLEVEL%"
 goto after_action
 

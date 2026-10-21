@@ -126,15 +126,19 @@ parser.add_argument("-ai", "--aicourse", type=str, nargs=2,
 
 parser.add_argument("--noexam", type=bool,
                     help="Disable AI exam")
+parser.add_argument("--interactive-menu", action="store_true",
+                    help="Choose video learning or AI questions after a shared login")
 parser.add_argument("--chapter-tests", choices=("menu", "list", "export", "answer"),
-                    help="Shared-course chapter tests: list, export or AI-answer")
+                    help="Chapter and meeting homework: list, export or AI-answer")
 parser.add_argument("--chapter-exam", help="Student exam ID from the chapter-test list")
-parser.add_argument("--chapter-all", action="store_true", help="Answer all ordinary chapter tests in one selected course")
+parser.add_argument("--chapter-all", action="store_true", help="Answer all chapter and meeting homework in one selected course")
 parser.add_argument("--chapter-submit", action="store_true", help="Submit each paper after every answer is saved and verified")
 
 args = parser.parse_args()
+if args.interactive_menu and (args.chapter_tests or args.aicourse or args.fetch):
+    parser.error("功能选择菜单不能与直接运行模式同时使用")
 if args.chapter_tests and (args.aicourse or args.fetch or args.videos):
-    parser.error("章节测试不能与 AI课程、获取课程清单或视频模式同时使用")
+    parser.error("AI 做题不能与 AI课程、获取课程清单或视频模式同时使用")
 if args.chapter_exam and not args.chapter_tests:
     parser.error("--chapter-exam 需要与 --chapter-tests 一起使用")
 if (args.chapter_all or args.chapter_submit) and args.chapter_tests != "answer":
@@ -216,15 +220,16 @@ if save_cookies and choice.reuse_cookies and os.path.exists(cookies_path):
         ls = fucker.getZhidaoList()
         if ls:
             fucker.getZhidaoContext(ls[-1].secret)
-        if args.chapter_tests:
+        if args.chapter_tests or args.interactive_menu:
             from chapter_tests import ChapterAPI
             ChapterAPI.from_client(fucker).authenticate()
-        else:
+        elif not args.interactive_menu:
             ls = fucker.getHikeList()
             if ls:
                 fucker.getHikeContext(ls[-1].courseId)
             ls = fucker.getZhidaoAiList()
-        print("Successfully recovered from saved cookies\n")
+        if not args.interactive_menu:
+            print("Successfully recovered from saved cookies\n")
         cookies_loaded = True
     except Exception:
         print("已保存的登录状态已失效或不匹配，重新登录当前选择的账号。")
@@ -245,7 +250,12 @@ if not cookies_loaded:
             username = username or prompt_field("账号：").strip()
             password = password or prompt_field("密码：", hidden=True)
             fucker.login(username, password, interactive=False)
-        print("Login Successful\n")
+        if args.chapter_tests or args.interactive_menu:
+            from chapter_tests import ChapterAPI
+            show_page("登录验证", "正在确认课程与 AI 做题的共用登录", ("首次登录正在建立考试系统会话，请稍候。",))
+            ChapterAPI.from_client(fucker).authenticate()
+        if not args.interactive_menu:
+            print("登录成功\n")
     except (MenuBack, KeyboardInterrupt):
         raise SystemExit(BACK_CODE)
     except Exception as e:
@@ -265,6 +275,11 @@ except (OSError, ValueError) as exc:
 # notice that cookies of zhihuishu.com expires if you login again in somewhere else
 # fucker.cookies = {}
 
+if args.interactive_menu:
+    from study_session import run_authenticated_menu
+    raise SystemExit(run_authenticated_menu(fucker, config.get("ai", {}), course, args.videos,
+                                            getRealPath("execution.json")))
+
 if args.chapter_tests:
     from chapter_tests import run_chapter_cli
     try:
@@ -273,7 +288,7 @@ if args.chapter_tests:
     except (MenuBack, KeyboardInterrupt):
         raise SystemExit(BACK_CODE)
     except Exception as exc:
-        print(f"章节测试处理未完成：{exc}")
+        print(f"AI 做题处理未完成：{exc}")
         raise SystemExit(1)
     if isinstance(chapter_outcome, dict) and chapter_outcome.get("status") == "batch_stopped":
         raise SystemExit(1)
